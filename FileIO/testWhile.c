@@ -21,9 +21,9 @@ int main()
     char *str = "Hello World";
     write(fd,str,strlen(str));    // 如果此处是strlen(str)+1的话会把'\0'写入文件中,导致文件被识别二进制，无法正常打开
 
-    #elif 0
+    #elif 1
     /* 清空文件*/
-    int fd = open("hello.txt", O_RDWR | O_TRUNC);
+    int fd = open("testOpen Copy.c", O_RDWR | O_TRUNC);
     if(fd == -1)
     {
         perror("open error");
