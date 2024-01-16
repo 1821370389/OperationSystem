@@ -11,6 +11,7 @@
 #define DEFAULT_QUEUE_MAX_SIZE 100
 #define TIME_INTERVAL 5
 #define DEFAULT_EXPANSION_SIZE 3
+#define DEFAULT_REDUCTION_SIZE 3
 
 /* 状态码 */
 enum STATUS_CODE
@@ -20,6 +21,11 @@ enum STATUS_CODE
     MALLOC_ERROR,
     ACCESS_INVAILD,
     THREAD_CREATE_ERROR,
+    THREAD_JOIN_ERROR,
+    THREAD_EXIT_ERROR,
+    THREAD_MUTEX_ERROR,
+    THREAD_COND_ERROR,
+    MUTEX_DESTROY_ERROR,
     UNKNOWN_ERROR,
     
 };
@@ -39,7 +45,8 @@ static int threadExitClrResources(thread_poll_t *thread_poll)
             break;
         }
     }
-    pthread_exit(NULL);
+    // pthread_exit(NULL);
+    return SUCCESS;
 }
 
 /* 线程函数 */
@@ -54,18 +61,20 @@ static void *threadHander(void *arg)
         {
             /* 等待一个条件变量被唤醒 */
             pthread_cond_wait(&thread_poll->notEmpty, &thread_poll->mutex);
-            if(thread_poll->exitSize > 0)
+
+        }
+        if(thread_poll->exitSize > 0)
+        {
+            thread_poll->exitSize--;
+            if(thread_poll->aliveSize > thread_poll->minSize)
             {
-                thread_poll->exitSize--;
+                
                 /* 解锁 */
                 pthread_mutex_unlock(&thread_poll->mutex);
-                if(thread_poll->aliveSize > thread_poll->minSize)
-                {
-                    /* 释放资源 */
-                    threadExitClrResources(thread_poll);
-                    /* 退出 */
-                    return NULL;
-                }
+                /* 释放资源 */
+                threadExitClrResources(thread_poll);
+                /* 退出 */
+                pthread_exit(NULL);
             }
         }
         /* 出队 */
@@ -104,10 +113,11 @@ static void *threadHander(void *arg)
     }
 }
 
+/* 管理员线程 */
 static void *mangerHander(void *arg)
 {
     thread_poll_t *thread_poll = (thread_poll_t *)arg;
-    while(1)
+    while(!thread_poll->shutdown)
     {
         sleep(TIME_INTERVAL);
 
@@ -122,22 +132,21 @@ static void *mangerHander(void *arg)
         pthread_mutex_unlock(&thread_poll->busyMutex);
 
         /* 扩容: 任务数>存活线程数 && 存活线程数<最大线程数  */
-        if(taskNum > aliveSize && aliveSize < thread_poll->maxSize)
+        if (taskNum > aliveSize && aliveSize < thread_poll->maxSize)
         {
             /* 一次扩大3个 */
             int count = 0;
             int ret = 0;
             pthread_mutex_lock(&thread_poll->mutex);
-            for(int idx = 0; count < DEFAULT_EXPANSION_SIZE && 
-            idx < thread_poll->maxSize && aliveSize <= thread_poll->maxSize; idx++)
+            for (int idx = 0; count < DEFAULT_EXPANSION_SIZE && idx < thread_poll->maxSize; idx++)
             {
-                if(thread_poll->threadID[idx] == 0)
+                if (thread_poll->threadID[idx] == 0)
                 {
                     ret = pthread_create(&thread_poll->threadID[idx], NULL, threadHander, thread_poll);
-                    if(ret != 0)
+                    if (ret != 0)
                     {
                         perror("pthread_create error");
-                        break;/* todo */
+                        break; /* todo */
                     }
                     count++;
                     thread_poll->aliveSize++;
@@ -145,22 +154,23 @@ static void *mangerHander(void *arg)
             }
             pthread_mutex_unlock(&thread_poll->mutex);
         }
+
         
         /* 缩容: 忙线程数*2>存活线程数 && 存活线程数>最小线程数 */
-        if((busySize << 1) > aliveSize && aliveSize > thread_poll->minSize)
+        if ((busySize << 1) > aliveSize && aliveSize > thread_poll->minSize)
         {
             pthread_mutex_lock(&thread_poll->mutex);
 
-            thread_poll->exitSize = DEFAULT_EXPANSION_SIZE;
-            for(int idx = 0; idx < DEFAULT_EXPANSION_SIZE; idx++)
-            {
-                pthread_cond_signal(&thread_poll->notEmpty);
-            }
+            /* 设置退出线程的数量 */
+            thread_poll->exitSize = DEFAULT_REDUCTION_SIZE;
+            /* 唤醒所有等待线程 */
+            pthread_cond_broadcast(&thread_poll->notEmpty);
+
             pthread_mutex_unlock(&thread_poll->mutex);
         }
-
-
     }
+    /* 管理线程退出 */
+    pthread_exit(NULL);
 }
 
 /* 线程池初始化 */
@@ -202,7 +212,7 @@ int threadPollInit(thread_poll_t *thread_poll, int minSize, int maxSize, int que
             perror("malloc error");
             break;
         }
-        meset(thread_poll->taskQueue, 0, sizeof(task_t) * queueCapacity);
+        memset(thread_poll->taskQueue, 0, sizeof(task_t) * queueCapacity);
         
 
         /* 为线程ID分配空间 */
@@ -213,11 +223,11 @@ int threadPollInit(thread_poll_t *thread_poll, int minSize, int maxSize, int que
             return MALLOC_ERROR;
         }
         /* 清除脏数据 */
-        meset(thread_poll->threadID, 0, sizeof(pthread_t) * maxSize);
+        memset(thread_poll->threadID, 0, sizeof(pthread_t) * maxSize);
 
         int ret = 0;
         /* 创建管理线程 */
-        ret = pthread_create(&thread_poll->managerID, NULL, mangerHander, (void*)thread_poll);
+        ret = pthread_create(&thread_poll->managerID, NULL, mangerHander, thread_poll);
         if(ret != 0)
         {
             perror("pthread_create error");
@@ -229,7 +239,7 @@ int threadPollInit(thread_poll_t *thread_poll, int minSize, int maxSize, int que
             /* 判断ID号是否能够使用 */
             if(thread_poll->threadID[idx] == 0)
             {
-                ret = pthread_create((thread_poll->threadID[idx]), NULL, threadHander, (void*)thread_poll);
+                ret = pthread_create(&thread_poll->threadID[idx], NULL, threadHander, thread_poll);
                 if(ret != 0)
                 {
                     // perror("pthread_create error");
@@ -288,14 +298,23 @@ int threadPollInit(thread_poll_t *thread_poll, int minSize, int maxSize, int que
     /* 回收管理者资源 */
     if(thread_poll->managerID != NULL)
     {
+        pthread_join(thread_poll->managerID, NULL);
         free(thread_poll->managerID);
         thread_poll->managerID = NULL;
     }
 
 
     /* 释放锁资源 */
-    pthread_mutex_destroy(&(thread_poll->mutex));
-    pthread_mutex_destroy(&(thread_poll->busyMutex));
+    if(pthread_mutex_destroy(&(thread_poll->mutex)) != 0)
+    {
+        perror("pthread_mutex_destroy error");
+        return MUTEX_DESTROY_ERROR;
+    }
+    if(pthread_mutex_destroy(&(thread_poll->busyMutex)) != 0)
+    {
+        perror("pthread_mutex_destroy error");
+        return MUTEX_DESTROY_ERROR;
+    }
     /* 释放条件变量资源 */
     pthread_cond_destroy(&(thread_poll->notEmpty));
     pthread_cond_destroy(&(thread_poll->notFull));
@@ -315,7 +334,7 @@ int threadPollAddTask(thread_poll_t *thread_poll, void *(*function)(void *), voi
     pthread_mutex_lock(&thread_poll->mutex);
     /* 任务队列满了 */
     // while(thread_poll->aliveSize == thread_poll->queueCapacity)
-    while(thread_poll->queueSize == thread_poll->queueCapacity)
+    while(thread_poll->queueSize >= thread_poll->queueCapacity)
     {
         pthread_cond_wait(&thread_poll->notFull, &thread_poll->mutex);
     }
@@ -344,6 +363,15 @@ int threadPollDestroy(thread_poll_t *thread_poll)
     
     /* 唤醒所有线程 */
     pthread_cond_broadcast(&thread_poll->notEmpty);
+
+    /* 等待所有线程退出 */
+    for (int idx = 0; idx < thread_poll->maxSize; idx++)
+    {
+        if (thread_poll->threadID[idx] != 0)
+        {
+            pthread_join(thread_poll->threadID[idx], NULL);
+        }
+    }
 
     return SUCCESS;
 }
