@@ -4,6 +4,7 @@
 #include <string.h>
 #include <errno.h>
 #include <pthread.h>
+#include <unistd.h>
 
 /* 默认最大最小值 */
 #define DEFAULT_MIN_THREAD_NUM 0
@@ -57,7 +58,7 @@ static void *threadHander(void *arg)
     {
         /* 加锁 */
         pthread_mutex_lock(&thread_poll->mutex);
-        while(thread_poll->queueSize == 0)
+        while(thread_poll->queueSize == 0 && thread_poll->shutdown != 1)
         {
             /* 等待一个条件变量被唤醒 */
             pthread_cond_wait(&thread_poll->notEmpty, &thread_poll->mutex);
@@ -296,11 +297,9 @@ int threadPollInit(thread_poll_t *thread_poll, int minSize, int maxSize, int que
         thread_poll->threadID = NULL;
     }
     /* 回收管理者资源 */
-    if(thread_poll->managerID != NULL)
+    if(thread_poll->managerID != 0)
     {
         pthread_join(thread_poll->managerID, NULL);
-        free(thread_poll->managerID);
-        thread_poll->managerID = NULL;
     }
 
 
@@ -360,6 +359,9 @@ int threadPollDestroy(thread_poll_t *thread_poll)
 {
 
     thread_poll->shutdown = 1;
+
+    /* 回收管理者线程 */
+    pthread_join(thread_poll->managerID, NULL);
     
     /* 唤醒所有线程 */
     pthread_cond_broadcast(&thread_poll->notEmpty);
